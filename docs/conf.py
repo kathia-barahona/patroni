@@ -29,7 +29,7 @@ from patroni.version import __version__
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 module_dir = os.path.abspath(os.path.join(project_root, 'patroni'))
-excludes = ['tests', 'setup.py', 'conf']
+excludes = ['tests', 'setup.py', 'conf', 'dcs/etcd3_grpc_stubs']
 
 # -- General configuration ------------------------------------------------
 
