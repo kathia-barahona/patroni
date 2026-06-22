@@ -26,6 +26,7 @@ KEYWORDS = 'etcd governor patroni postgresql postgres ha haproxy confd' +\
     ' zookeeper exhibitor consul streaming replication kubernetes k8s'
 
 EXTRAS_REQUIRE = {'aws': ['boto3'], 'etcd': ['python-etcd'], 'etcd3': ['python-etcd'],
+                  'etcd3_grpc': ['grpcio', 'protobuf'],
                   'consul': ['py-consul'], 'exhibitor': ['kazoo'], 'zookeeper': ['kazoo'],
                   'systemd': ['systemd-python'],
                   'kubernetes': [], 'raft': ['pysyncobj', 'cryptography'], 'jsonlogger': ['python-json-logger']}
