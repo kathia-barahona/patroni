@@ -224,22 +224,21 @@ class TestCatchGrpcErrors:
 @patch("grpc.insecure_channel", return_value=mock_grpc_channel())
 class TestEtcd3Grpc:
     def _make_dcs(self) -> Etcd3_grpc:
-        with (
-            patch.object(Etcd3GrpcClient, "lease_grant", return_value=123),
-            patch.object(Etcd3GrpcClient, "get_prefix", return_value=make_range_response(make_cluster_kvs())),
-            patch.object(GrpcKVCache, "start"),
-        ):
-            dcs = Etcd3_grpc(
-                {
-                    "namespace": "/patroni/",
-                    "ttl": 30,
-                    "retry_timeout": 10,
-                    "name": "foo",
-                    "scope": "test",
-                    "etcd3_grpc": {"host": "127.0.0.1", "port": 2379},
-                },
-                get_mpp({}),
-            )
+        with patch.object(Etcd3GrpcClient, "lease_grant", return_value=123):
+            with patch.object(Etcd3GrpcClient, "get_prefix",
+                              return_value=make_range_response(make_cluster_kvs())):
+                with patch.object(GrpcKVCache, "start"):
+                    dcs = Etcd3_grpc(
+                        {
+                            "namespace": "/patroni/",
+                            "ttl": 30,
+                            "retry_timeout": 10,
+                            "name": "foo",
+                            "scope": "test",
+                            "etcd3_grpc": {"host": "127.0.0.1", "port": 2379},
+                        },
+                        get_mpp({}),
+                    )
         return dcs
 
     def test_init(self, mock_channel: Mock) -> None:
@@ -266,13 +265,11 @@ class TestEtcd3Grpc:
         dcs = self._make_dcs()
         with patch.object(Etcd3GrpcClient, "get_prefix", return_value=make_range_response(make_cluster_kvs())):
             dcs.get_cluster()
-        with (
-            patch.object(Etcd3GrpcClient, "put", return_value=Mock()) as mock_put,
-            patch.object(Etcd3GrpcClient, "lease_keepalive", return_value=True),
-        ):
-            dcs._last_lease_refresh = 0
-            assert dcs.touch_member({"conn_url": "http://localhost:5432"}) is True
-            mock_put.assert_called_once()
+        with patch.object(Etcd3GrpcClient, "put", return_value=Mock()) as mock_put:
+            with patch.object(Etcd3GrpcClient, "lease_keepalive", return_value=True):
+                dcs._last_lease_refresh = 0
+                assert dcs.touch_member({"conn_url": "http://localhost:5432"}) is True
+                mock_put.assert_called_once()
 
     def test_touch_member_no_lease(self, mock_channel: Mock) -> None:
         dcs = self._make_dcs()
@@ -286,13 +283,11 @@ class TestEtcd3Grpc:
         dcs = self._make_dcs()
         with patch.object(Etcd3GrpcClient, "get_prefix", return_value=make_range_response(make_cluster_kvs())):
             dcs.get_cluster()
-        with (
-            patch.object(Etcd3GrpcClient, "put") as mock_put,
-            patch.object(Etcd3GrpcClient, "lease_keepalive", return_value=True),
-        ):
-            dcs._last_lease_refresh = 0
-            assert dcs.touch_member({}) is True
-            mock_put.assert_not_called()
+        with patch.object(Etcd3GrpcClient, "put") as mock_put:
+            with patch.object(Etcd3GrpcClient, "lease_keepalive", return_value=True):
+                dcs._last_lease_refresh = 0
+                assert dcs.touch_member({}) is True
+                mock_put.assert_not_called()
 
     def test_take_leader(self, mock_channel: Mock) -> None:
         dcs = self._make_dcs()
@@ -303,23 +298,19 @@ class TestEtcd3Grpc:
         dcs = self._make_dcs()
         txn_resp = Mock()
         txn_resp.succeeded = True
-        with (
-            patch.object(Etcd3GrpcClient, "txn", return_value=txn_resp),
-            patch.object(Etcd3GrpcClient, "lease_keepalive", return_value=True),
-        ):
-            dcs._last_lease_refresh = 0
-            assert dcs.attempt_to_acquire_leader() is True
+        with patch.object(Etcd3GrpcClient, "txn", return_value=txn_resp):
+            with patch.object(Etcd3GrpcClient, "lease_keepalive", return_value=True):
+                dcs._last_lease_refresh = 0
+                assert dcs.attempt_to_acquire_leader() is True
 
     def test_attempt_to_acquire_leader_fail(self, mock_channel: Mock) -> None:
         dcs = self._make_dcs()
         txn_resp = Mock()
         txn_resp.succeeded = False
-        with (
-            patch.object(Etcd3GrpcClient, "txn", return_value=txn_resp),
-            patch.object(Etcd3GrpcClient, "lease_keepalive", return_value=True),
-        ):
-            dcs._last_lease_refresh = 0
-            assert dcs.attempt_to_acquire_leader() is False
+        with patch.object(Etcd3GrpcClient, "txn", return_value=txn_resp):
+            with patch.object(Etcd3GrpcClient, "lease_keepalive", return_value=True):
+                dcs._last_lease_refresh = 0
+                assert dcs.attempt_to_acquire_leader() is False
 
     def test_attempt_to_acquire_leader_no_lease(self, mock_channel: Mock) -> None:
         dcs = self._make_dcs()
@@ -342,12 +333,10 @@ class TestEtcd3Grpc:
             cluster = dcs.get_cluster()
         txn_resp = Mock()
         txn_resp.succeeded = True
-        with (
-            patch.object(Etcd3GrpcClient, "txn", return_value=txn_resp),
-            patch.object(Etcd3GrpcClient, "lease_keepalive", return_value=True),
-        ):
-            dcs._last_lease_refresh = 0
-            assert dcs._update_leader(cluster.leader) is True
+        with patch.object(Etcd3GrpcClient, "txn", return_value=txn_resp):
+            with patch.object(Etcd3GrpcClient, "lease_keepalive", return_value=True):
+                dcs._last_lease_refresh = 0
+                assert dcs._update_leader(cluster.leader) is True
 
     def test_delete_leader(self, mock_channel: Mock) -> None:
         dcs = self._make_dcs()

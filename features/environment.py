@@ -642,7 +642,7 @@ class Etcd3_grpcController(AbstractDcsController):
                 'ssl_target_name': 'localhost',
             })
             self._client.connect()
-            self._client.member_list()
+            self._client.get_prefix('/patroni/__probe__', timeout=2.0)
             return True
         except Exception:
             return False

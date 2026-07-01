@@ -5,21 +5,31 @@ import sys
 import time
 
 from collections import defaultdict
-from collections.abc import Callable, Iterator
 from pathlib import Path
 from threading import Condition, Event as ThreadEvent, Lock, Thread
-from typing import Any, Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING, TypeVar, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING, TypeVar, Union
 from urllib.parse import urlparse
 
 import grpc
 
 from patroni.dcs import AbstractDCS, Cluster, ClusterConfig, \
     Failover, Leader, Member, Status, SyncState, TimelineHistory
-from patroni.dcs.etcd import StaleEtcdNode, StaleEtcdNodeGuard
 from patroni.exceptions import DCSError
 from patroni.utils import deep_compare, Retry, RetryFailedError
 
 if TYPE_CHECKING:
+    from typing import Protocol
+
+    class _KV(Protocol):
+        key: bytes
+        value: bytes
+        mod_revision: int
+        lease: int
+
+    class _WatchEvent(Protocol):
+        kv: _KV
+        type: int
+
     from ..postgresql.mpp import AbstractMPP
 
 # Generated from etcd v3.5.17 proto definitions.
@@ -33,6 +43,40 @@ from google.protobuf.message import Message  # noqa: E402
 logger = logging.getLogger(__name__)
 
 RespT = TypeVar("RespT")
+
+
+class StaleEtcdNode(Exception):
+    """Node is stale (raft term is older than previous known)."""
+
+
+class StaleEtcdNodeGuard(object):
+
+    def __init__(self) -> None:
+        self._reset_cluster_raft_term()
+
+    def _reset_cluster_raft_term(self) -> None:
+        self._cluster_id: Optional[str] = None
+        self._raft_term = 0
+
+    def _check_cluster_raft_term(self, cluster_id: Optional[str], value: Union[None, str, int]) -> None:
+        if not (cluster_id and value):
+            return
+
+        if self._cluster_id and self._cluster_id != cluster_id:
+            logger.warning('Etcd Cluster ID changed from %s to %s', self._cluster_id, cluster_id)
+            self._raft_term = 0
+        self._cluster_id = cluster_id
+
+        try:
+            raft_term = int(value)
+        except Exception:
+            return
+
+        if raft_term < self._raft_term:
+            logger.warning('Connected to Etcd node with term %d. Old known term %d. Switching to another node.',
+                           raft_term, self._raft_term)
+            raise StaleEtcdNode
+        self._raft_term = raft_term
 
 
 class Etcd3GrpcError(DCSError):
@@ -333,18 +377,6 @@ def catch_grpc_errors(func: Callable[..., Any]) -> Any:
     return wrapper
 
 
-class _KV(Protocol):
-    key: bytes
-    value: bytes
-    mod_revision: int
-    lease: int
-
-
-class _WatchEvent(Protocol):
-    kv: _KV
-    type: int
-
-
 class GrpcKVCache(StaleEtcdNodeGuard, Thread):
     """In-memory cache of etcd keys under a prefix, kept up-to-date via a gRPC watch stream.
 
@@ -388,7 +420,7 @@ class GrpcKVCache(StaleEtcdNodeGuard, Thread):
         with self._object_cache_lock:
             return [v.copy() for v in self._object_cache.values()]
 
-    def _process_event(self, event: _WatchEvent) -> None:
+    def _process_event(self, event: "_WatchEvent") -> None:
         kv = event.kv
         key = kv.key.decode("utf-8")
         node = {
