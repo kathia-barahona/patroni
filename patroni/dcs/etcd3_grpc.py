@@ -1,9 +1,10 @@
+import time
 import logging
 import sys
 
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional, Tuple, TypeVar
 from urllib.parse import urlparse
 
 import grpc
@@ -44,6 +45,9 @@ class Etcd3GrpcClient(StaleEtcdNodeGuard):
         self._lease_stub: Any = None
         self._watch_stub: Any = None
         self._cluster_stub: Any = None
+        self._machines_cache_ttl: int = config.get("machines_cache_ttl", 300)
+        self._machines_cache_updated: float = 0
+        self._update_machines_cache: bool = False
 
     @staticmethod
     def _parse_endpoints(config: Dict[str, Any]) -> List[str]:
@@ -83,7 +87,7 @@ class Etcd3GrpcClient(StaleEtcdNodeGuard):
     def _create_channel(self) -> grpc.Channel:
         endpoint = self._endpoints[self._current_endpoint_idx]
         logger.info("Connecting to etcd at %s via gRPC", endpoint)
-        options: List[tuple[str, Any]] = [
+        options: List[Tuple[str, Any]] = [
             ("grpc.keepalive_time_ms", 10000),
             ("grpc.keepalive_timeout_ms", 5000),
             ("grpc.keepalive_permit_without_calls", 1),
@@ -111,19 +115,102 @@ class Etcd3GrpcClient(StaleEtcdNodeGuard):
         self.close()
         self.connect()
 
+    @staticmethod
+    def _calculate_timeouts(etcd_nodes: int, timeout: float) -> Tuple[int, float, int]:
+        """Calculate per-node timeout and retries, splitting the budget across available nodes.
+
+        For clusters with 1 node: up to 2 retries per node.
+        For clusters with 2 nodes: 1 retry per node.
+        For clusters with 3+ nodes: no retries, just try next node.
+        If per-node timeout would be < 1s, reduce the number of nodes to try.
+        """
+        per_node_timeout = timeout
+        max_retries = 4 - min(etcd_nodes, 3)
+        per_node_retries = 1
+        min_timeout = 1.0
+
+        while etcd_nodes > 0:
+            per_node_timeout = timeout / etcd_nodes
+            if per_node_timeout >= min_timeout:
+                while per_node_retries < max_retries and per_node_timeout / (per_node_retries + 1) >= min_timeout:
+                    per_node_retries += 1
+                per_node_timeout /= per_node_retries
+                break
+            etcd_nodes -= 1
+            max_retries = 1
+
+        return etcd_nodes, per_node_timeout, per_node_retries - 1
+
+    def _refresh_machines_cache(self) -> None:
+        """Refresh the endpoint list by calling member_list() on the current node."""
+        try:
+            request = rpc_pb2.MemberListRequest()
+            resp = self._cluster_stub.MemberList(request, timeout=2.0)
+            new_endpoints = []
+            for member in resp.members:
+                for url in member.clientURLs:
+                    parsed = urlparse(url)
+                    host = parsed.hostname
+                    port = parsed.port or 2379
+                    if not host:
+                        continue
+                    endpoint = f"[{host}:{port}]" if ":" in host else f"{host}:{port}"
+                    if endpoint not in new_endpoints:
+                        new_endpoints.append(endpoint)
+            if new_endpoints:
+                logger.info("Updated etcd endpoints from member_list: %s", new_endpoints)
+                self._endpoints = new_endpoints
+                self._current_endpoint_idx = self._current_endpoint_idx % len(self._endpoints)
+            self._machines_cache_updated = time.time()
+            self._update_machines_cache = False
+        except Exception as e:
+            logger.warning("Failed to refresh machines cache: %r", e)
+            self._update_machines_cache = True
+
     def _call(
         self,
         stub_method: Callable[..., RespT],
         request: Message,
         timeout: Optional[float] = None,
     ) -> RespT:
-        try:
-            return stub_method(request, timeout=timeout or self._default_timeout)
-        except grpc.RpcError as e:
-            code = e.code()
-            if code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
+        if self._update_machines_cache:
+            self._refresh_machines_cache()
+        elif time.time() - self._machines_cache_updated > self._machines_cache_ttl:
+            self._refresh_machines_cache()
+
+        deadline = time.time() + (timeout or self._retry_timeout)
+        some_request_failed = False
+
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise Etcd3GrpcError("Exceeded retry deadline")
+
+            etcd_nodes = len(self._endpoints)
+            nodes_to_try, per_node_timeout, retries = self._calculate_timeouts(etcd_nodes, remaining)
+
+            if nodes_to_try == 0:
+                raise Etcd3GrpcError("No time left to try any etcd node")
+
+            for _ in range(nodes_to_try):
+                for attempt in range(retries + 1):
+                    try:
+                        result = stub_method(request, timeout=per_node_timeout)
+                        if some_request_failed:
+                            self._refresh_machines_cache()
+                        return result
+                    except grpc.RpcError as e:
+                        code = e.code()
+                        if code not in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
+                            raise Etcd3GrpcError(f"gRPC error: {code.name} {e.details()}") from e
+                        some_request_failed = True
+                        if attempt == retries:
+                            break
                 self._rotate_endpoint()
-            raise Etcd3GrpcError(f"gRPC error: {code.name} {e.details()}") from e
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise Etcd3GrpcError("Exceeded retry deadline after exhausting all nodes")
 
     # -- KV operations --
 
@@ -174,9 +261,8 @@ class Etcd3GrpcClient(StaleEtcdNodeGuard):
     # -- Cluster --
 
     def member_list(self) -> List[str]:
-        request = rpc_pb2.MemberListRequest()
-        resp = self._call(self._cluster_stub.MemberList, request)
-        return [url for member in resp.members for url in member.clientURLs]
+        self._refresh_machines_cache()
+        return list(self._endpoints)
 
     def get_cluster(self, path: str) -> List[Dict[str, str]]:
         """Get all keys under path, returning them in Patroni's expected node format."""
