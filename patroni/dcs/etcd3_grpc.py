@@ -252,11 +252,14 @@ class Etcd3GrpcClient(StaleEtcdNodeGuard):
             yield rpc_pb2.LeaseKeepAliveRequest(ID=lease_id)
 
         try:
-            responses = self._lease_stub.LeaseKeepAlive(request_iter())
+            responses = self._lease_stub.LeaseKeepAlive(request_iter(), timeout=self._retry_timeout)
             resp = next(responses)
             return bool(resp.TTL > 0)
         except grpc.RpcError as e:
-            raise Etcd3GrpcError(f"lease_keepalive failed: {e.code().name}") from e
+            code = e.code()
+            if code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
+                self._rotate_endpoint()
+            raise Etcd3GrpcError(f"lease_keepalive failed: {code.name}") from e
 
     # -- Cluster --
 
