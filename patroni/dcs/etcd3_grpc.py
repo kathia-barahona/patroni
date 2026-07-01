@@ -7,14 +7,15 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, TypeVar, Union
+from threading import Condition, Event as ThreadEvent, Lock, Thread
+from typing import Any, Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING, TypeVar, Union
 from urllib.parse import urlparse
 
 import grpc
 
 from patroni.dcs import AbstractDCS, Cluster, ClusterConfig, \
     Failover, Leader, Member, Status, SyncState, TimelineHistory
-from patroni.dcs.etcd import StaleEtcdNodeGuard
+from patroni.dcs.etcd import StaleEtcdNode, StaleEtcdNodeGuard
 from patroni.exceptions import DCSError
 from patroni.utils import deep_compare, Retry, RetryFailedError
 
@@ -52,7 +53,6 @@ class Etcd3GrpcClient(StaleEtcdNodeGuard):
         self._retry_timeout: float = config.get("retry_timeout", 10.0)
         self._kv_stub: Any = None
         self._lease_stub: Any = None
-        self._watch_stub: Any = None
         self._cluster_stub: Any = None
         self._machines_cache_ttl: int = config.get("machines_cache_ttl", 300)
         self._machines_cache_updated: float = 0
@@ -113,6 +113,7 @@ class Etcd3GrpcClient(StaleEtcdNodeGuard):
         self._kv_stub = rpc_pb2_grpc.KVStub(self._channel)
         self._lease_stub = rpc_pb2_grpc.LeaseStub(self._channel)
         self._cluster_stub = rpc_pb2_grpc.ClusterStub(self._channel)
+        self._machines_cache_updated = time.time()
 
     def close(self) -> None:
         if self._channel:
@@ -311,6 +312,184 @@ def catch_grpc_errors(func: Callable[..., Any]) -> Any:
     return wrapper
 
 
+class _KV(Protocol):
+    key: bytes
+    value: bytes
+    mod_revision: int
+    lease: int
+
+
+class _WatchEvent(Protocol):
+    kv: _KV
+    type: int
+
+
+class GrpcKVCache(StaleEtcdNodeGuard, Thread):
+    """In-memory cache of etcd keys under a prefix, kept up-to-date via a gRPC watch stream.
+
+    Mirrors the KVCache pattern from the HTTP etcd3 implementation: loads an initial snapshot,
+    then applies watch events incrementally. The DCS layer reads from cache instead of hitting
+    etcd on every HA loop iteration.
+    """
+
+    def __init__(self, dcs: "Etcd3_grpc", client: Etcd3GrpcClient) -> None:
+        Thread.__init__(self)
+        StaleEtcdNodeGuard.__init__(self)
+        self.daemon = True
+        self._dcs = dcs
+        self._client = client
+        self.condition = Condition()
+        self._is_ready = False
+        self._object_cache: Dict[str, Dict[str, Any]] = {}
+        self._object_cache_lock = Lock()
+        self._cancel_event = ThreadEvent()
+        self._stopped = False
+        self.start()
+
+    def set(self, value: Dict[str, Any], overwrite: bool = False) -> bool:
+        with self._object_cache_lock:
+            name = value["key"]
+            old_value = self._object_cache.get(name)
+            ret = not old_value or int(old_value["mod_revision"]) < int(value["mod_revision"])
+            if ret or overwrite and old_value and old_value["mod_revision"] == value["mod_revision"]:
+                self._object_cache[name] = value
+        return ret
+
+    def delete(self, name: str, mod_revision: str) -> bool:
+        with self._object_cache_lock:
+            old_value = self._object_cache.get(name)
+            ret = old_value and int(old_value["mod_revision"]) < int(mod_revision)
+            if ret:
+                del self._object_cache[name]
+        return bool(not old_value or ret)
+
+    def copy(self) -> List[Dict[str, Any]]:
+        with self._object_cache_lock:
+            return [v.copy() for v in self._object_cache.values()]
+
+    def _process_event(self, event: _WatchEvent) -> None:
+        kv = event.kv
+        key = kv.key.decode("utf-8")
+        node = {
+            "key": key,
+            "value": kv.value.decode("utf-8"),
+            "mod_revision": str(kv.mod_revision),
+            "lease": str(kv.lease) if kv.lease else None,
+        }
+
+        if event.type == 1:  # DELETE
+            success = self.delete(key, str(kv.mod_revision))
+        else:
+            success = self.set(node, True)
+
+        if success:
+            self._event.set()
+
+    def _build_cache(self) -> None:
+        prefix = self.__cluster_prefix()
+        resp = self._client.get_prefix(prefix)
+        revision = str(resp.header.revision)
+
+        with self._object_cache_lock:
+            self._reset_cluster_raft_term()
+            self._object_cache = {}
+            for kv in resp.kvs:
+                key = kv.key.decode("utf-8")
+                self._object_cache[key] = {
+                    "key": key,
+                    "value": kv.value.decode("utf-8"),
+                    "mod_revision": str(kv.mod_revision),
+                    "lease": str(kv.lease) if kv.lease else None,
+                }
+            self._check_cluster_raft_term(str(resp.header.cluster_id), resp.header.raft_term)
+
+        with self.condition:
+            self._is_ready = True
+            self.condition.notify_all()
+
+        self._do_watch(revision)
+
+    def _do_watch(self, start_revision: str) -> None:
+        channel = self._client._create_channel()
+        try:
+            watch_stub = rpc_pb2_grpc.WatchStub(channel)
+            prefix = self.__cluster_prefix()
+            range_end = _prefix_range_end(prefix)
+
+            create_request = rpc_pb2.WatchCreateRequest(
+                key=prefix.encode(),
+                range_end=range_end,
+                start_revision=int(start_revision) + 1,
+            )
+            watch_request = rpc_pb2.WatchRequest(create_request=create_request)
+
+            def request_iter() -> Iterator[Dict[str, Any]]:
+                yield watch_request
+                while not self._cancel_event.is_set():
+                    if self._cancel_event.wait(timeout=10):
+                        return
+
+            response_iter = watch_stub.Watch(request_iter())
+            for resp in response_iter:
+                if self._cancel_event.is_set():
+                    return
+                if resp.canceled:
+                    logger.warning("Watch stream canceled: %s", resp.cancel_reason)
+                    break
+                if resp.header.cluster_id:
+                    self._check_cluster_raft_term(str(resp.header.cluster_id), resp.header.raft_term)
+                for event in resp.events:
+                    self._process_event(event)
+        finally:
+            channel.close()
+            with self.condition:
+                self._is_ready = False
+
+    def run(self) -> None:
+        while not self._stopped:
+            try:
+                self._cancel_event.clear()
+                self._build_cache()
+            except Exception as e:
+                if self._stopped:
+                    return
+                logger.error('GrpcKVCache.run %r', e)
+                with self.condition:
+                    self._is_ready = False
+            if not self._stopped:
+                time.sleep(1)
+
+    def is_ready(self) -> bool:
+        if self._is_ready:
+            try:
+                self._client._check_cluster_raft_term(self._cluster_id, self._raft_term)
+            except StaleEtcdNode:
+                self._is_ready = False
+                self.kill_stream()
+        return self._is_ready
+
+    def update_cache_on_put(self, key: str, value: str, mod_revision: str, lease: Optional[int] = None) -> None:
+        """Write-through: update the cache immediately after a successful put."""
+        node = {
+            "key": key,
+            "value": value,
+            "mod_revision": mod_revision,
+            "lease": str(lease) if lease else None,
+        }
+        self.set(node)
+
+    def update_cache_on_delete(self, key: str, mod_revision: str) -> None:
+        """Write-through: remove from cache immediately after a successful delete."""
+        self.delete(key, mod_revision)
+
+    def kill_stream(self) -> None:
+        self._cancel_event.set()
+
+    def stop(self) -> None:
+        self._stopped = True
+        self._cancel_event.set()
+
+
 class Etcd3_grpc(AbstractDCS):
     def __init__(self, config: Dict[str, Any], mpp: 'AbstractMPP') -> None:
         super().__init__(config, mpp)
@@ -327,9 +506,12 @@ class Etcd3_grpc(AbstractDCS):
         self._connect_with_retry()
 
         self._do_not_watch = False
+        self._kv_cache: Optional[GrpcKVCache] = None
 
         if not self._ctl:
             self._create_lease()
+            self._kv_cache = GrpcKVCache(self, self._client)
+            self._client._kv_cache = self._kv_cache
 
     def retry(self, method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         retry = self._retry.copy()
@@ -435,6 +617,10 @@ class Etcd3_grpc(AbstractDCS):
         return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
 
     def _get_cluster_nodes(self, path: str) -> List[Dict[str, Any]]:
+        """Get cluster nodes, using the KV cache when available, falling back to direct RPC."""
+        if self._kv_cache and self._kv_cache.is_ready() and path.startswith(self._cluster_prefix()):
+            with self._kv_cache.condition:
+                return self._kv_cache.copy()
         return self._client.get_cluster(path)
 
     def _postgresql_cluster_loader(self, path: str) -> Cluster:
@@ -641,6 +827,10 @@ class Etcd3_grpc(AbstractDCS):
     @catch_grpc_errors
     def delete_sync_state(self, version: Optional[str] = None) -> bool:
         return bool(self.retry(self._client.delete, self.sync_path))
+
+    def _stop_watcher(self) -> None:
+        if self._kv_cache:
+            self._kv_cache.stop()
 
     def _cluster_prefix(self) -> str:
         return str(self._base_path + "/" if self.is_mpp_coordinator() else self.client_path(""))
