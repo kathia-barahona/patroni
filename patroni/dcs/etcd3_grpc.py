@@ -57,6 +57,7 @@ class Etcd3GrpcClient(StaleEtcdNodeGuard):
         self._machines_cache_ttl: int = config.get("machines_cache_ttl", 300)
         self._machines_cache_updated: float = 0
         self._update_machines_cache: bool = False
+        self._kv_cache: Optional[GrpcKVCache] = None
 
     @staticmethod
     def _parse_endpoints(config: Dict[str, Any]) -> List[str]:
@@ -226,7 +227,10 @@ class Etcd3GrpcClient(StaleEtcdNodeGuard):
 
     def put(self, key: str, value: str, lease: int = 0) -> rpc_pb2.PutResponse:
         request = rpc_pb2.PutRequest(key=key.encode(), value=value.encode(), lease=lease)
-        return self._call(self._kv_stub.Put, request)
+        resp = self._call(self._kv_stub.Put, request)
+        if self._kv_cache:
+            self._kv_cache.update_cache_on_put(key, value, str(resp.header.revision), lease or None)
+        return resp
 
     def get(self, key: str) -> rpc_pb2.RangeResponse:
         request = rpc_pb2.RangeRequest(key=key.encode())
@@ -239,7 +243,10 @@ class Etcd3GrpcClient(StaleEtcdNodeGuard):
 
     def delete(self, key: str) -> rpc_pb2.DeleteRangeResponse:
         request = rpc_pb2.DeleteRangeRequest(key=key.encode())
-        return self._call(self._kv_stub.DeleteRange, request)
+        resp = self._call(self._kv_stub.DeleteRange, request)
+        if self._kv_cache:
+            self._kv_cache.update_cache_on_delete(key, str(resp.header.revision))
+        return resp
 
     def delete_prefix(self, prefix: str) -> rpc_pb2.DeleteRangeResponse:
         range_end = _prefix_range_end(prefix)
@@ -248,7 +255,21 @@ class Etcd3GrpcClient(StaleEtcdNodeGuard):
 
     def txn(self, compare: List[Any], success: List[Any], failure: Optional[List[Any]] = None) -> rpc_pb2.TxnResponse:
         request = rpc_pb2.TxnRequest(compare=compare, success=success, failure=failure or [])
-        return self._call(self._kv_stub.Txn, request)
+        resp = self._call(self._kv_stub.Txn, request)
+        if self._kv_cache:
+            if resp.succeeded and success:
+                op = success[0]
+                if op.HasField("request_put"):
+                    put_req = op.request_put
+                    self._kv_cache.update_cache_on_put(
+                        put_req.key.decode(), put_req.value.decode(), str(resp.header.revision), put_req.lease or None
+                    )
+                elif op.HasField("request_delete_range"):
+                    del_req = op.request_delete_range
+                    self._kv_cache.update_cache_on_delete(del_req.key.decode(), str(resp.header.revision))
+            elif not resp.succeeded and not failure:
+                self._kv_cache.kill_stream()
+        return resp
 
     # -- Lease operations --
 
