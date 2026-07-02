@@ -122,7 +122,7 @@ jobs:
       matrix:
         os: [ubuntu]
         python-version: [3.7, 3.14]
-        dcs: [etcd, etcd3, consul, exhibitor, kubernetes, raft]
+        dcs: [etcd, etcd3, etcd3_grpc, consul, exhibitor, kubernetes, raft]
         include:
         - os: macos
           python-version: 3.8

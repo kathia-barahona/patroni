@@ -26,6 +26,7 @@ KEYWORDS = 'etcd governor patroni postgresql postgres ha haproxy confd' +\
     ' zookeeper exhibitor consul streaming replication kubernetes k8s'
 
 EXTRAS_REQUIRE = {'aws': ['boto3'], 'etcd': ['python-etcd'], 'etcd3': ['python-etcd'],
+                  'etcd3_grpc': ['grpcio', 'protobuf'],
                   'consul': ['py-consul'], 'exhibitor': ['kazoo'], 'zookeeper': ['kazoo'],
                   'systemd': ['systemd-python'],
                   'kubernetes': [], 'raft': ['pysyncobj', 'cryptography'], 'jsonlogger': ['python-json-logger']}
@@ -102,6 +103,8 @@ class _Lint(_Command):
 
     def files_to_check(self):
         for path in self.dirs_to_check():
+            if 'etcd3_grpc_stubs' in path:
+                continue
             for python_file in glob.iglob(os.path.join(path, '*.py')):
                 yield python_file
 

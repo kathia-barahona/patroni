@@ -4,7 +4,9 @@
   ],
 
   "exclude": [
-    "**/__pycache__"
+    "**/__pycache__",
+    "patroni/dcs/etcd3_grpc_stubs",
+    "patroni/dcs/etcd3_grpc.py"
   ],
 
   "ignore": [

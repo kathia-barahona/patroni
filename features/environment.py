@@ -228,6 +228,9 @@ class PatroniController(AbstractController):
         if isinstance(self._context.dcs_ctl, KubernetesController):
             config['kubernetes'] = {'bootstrap_labels': {'foo': 'bar'}}
 
+        if isinstance(self._context.dcs_ctl, Etcd3_grpcController):
+            config['etcd3_grpc'] = self._context.dcs_ctl.get_dcs_config()
+
         if self._context.postgres_supports_ssl and self._context.certfile:
             config['postgresql']['parameters'].update({
                 'ssl': 'on',
@@ -559,6 +562,123 @@ class Etcd3Controller(AbstractEtcdController):
     def cleanup_service_tree(self):
         try:
             self._client.deleteprefix(self.path(scope=''))
+        except Exception as e:
+            assert False, "exception when cleaning up etcd contents: {0}".format(e)
+
+
+class Etcd3_grpcController(AbstractDcsController):
+
+    def __init__(self, context):
+        super(Etcd3_grpcController, self).__init__(context)
+        self._certs_dir = os.path.join(self._work_directory, 'certs')
+        os.makedirs(self._certs_dir, exist_ok=True)
+        self._generate_certs()
+
+    def _generate_certs(self):
+        """Generate CA, server, and client certs for mTLS."""
+        self._ca_cert = os.path.join(self._certs_dir, 'ca.crt')
+        self._ca_key = os.path.join(self._certs_dir, 'ca.key')
+        self._server_cert = os.path.join(self._certs_dir, 'server.crt')
+        self._server_key = os.path.join(self._certs_dir, 'server.key')
+        self._client_cert = os.path.join(self._certs_dir, 'client.crt')
+        self._client_key = os.path.join(self._certs_dir, 'client.key')
+
+        with open(os.devnull, 'w') as null:
+            # Generate CA
+            subprocess.check_call([
+                'openssl', 'req', '-x509', '-new', '-nodes',
+                '-keyout', self._ca_key, '-out', self._ca_cert,
+                '-subj', '/CN=etcd-test-ca', '-days', '1'
+            ], stdout=null, stderr=null)
+
+            # Generate server cert
+            server_csr = os.path.join(self._certs_dir, 'server.csr')
+            server_ext = os.path.join(self._certs_dir, 'server.ext')
+            subprocess.check_call([
+                'openssl', 'req', '-new', '-nodes',
+                '-keyout', self._server_key, '-out', server_csr,
+                '-subj', '/CN=localhost'
+            ], stdout=null, stderr=null)
+            with open(server_ext, 'w') as f:
+                f.write('subjectAltName=IP:127.0.0.1,DNS:localhost\n')
+            subprocess.check_call([
+                'openssl', 'x509', '-req', '-in', server_csr,
+                '-CA', self._ca_cert, '-CAkey', self._ca_key, '-CAcreateserial',
+                '-out', self._server_cert, '-days', '1', '-extfile', server_ext
+            ], stdout=null, stderr=null)
+
+            # Generate client cert
+            client_csr = os.path.join(self._certs_dir, 'client.csr')
+            subprocess.check_call([
+                'openssl', 'req', '-new', '-nodes',
+                '-keyout', self._client_key, '-out', client_csr,
+                '-subj', '/CN=client'
+            ], stdout=null, stderr=null)
+            subprocess.check_call([
+                'openssl', 'x509', '-req', '-in', client_csr,
+                '-CA', self._ca_cert, '-CAkey', self._ca_key, '-CAcreateserial',
+                '-out', self._client_cert, '-days', '1'
+            ], stdout=null, stderr=null)
+
+    def _start(self):
+        return psutil.Popen([
+            "etcd", "--data-dir", self._work_directory,
+            "--client-cert-auth=true",
+            "--trusted-ca-file", self._ca_cert,
+            "--cert-file", self._server_cert,
+            "--key-file", self._server_key,
+            "--listen-client-urls", "https://127.0.0.1:2379",
+            "--advertise-client-urls", "https://127.0.0.1:2379",
+        ], stdout=self._log, stderr=subprocess.STDOUT)
+
+    def _is_running(self):
+        from patroni.dcs.etcd3_grpc import Etcd3GrpcClient
+        try:
+            self._client = Etcd3GrpcClient({
+                'host': '127.0.0.1', 'port': 2379,
+                'cacert': self._ca_cert,
+                'cert': self._client_cert,
+                'key': self._client_key,
+                'ssl_target_name': 'localhost',
+            })
+            self._client.connect()
+            self._client.get_prefix('/patroni/__probe__', timeout=2.0)
+            return True
+        except Exception:
+            return False
+
+    def get_dcs_config(self):
+        """Return the etcd3_grpc DCS config dict for Patroni YAML injection."""
+        return {
+            'host': '127.0.0.1',
+            'port': 2379,
+            'cacert': self._ca_cert,
+            'cert': self._client_cert,
+            'key': self._client_key,
+            'ssl_target_name': 'localhost',
+        }
+
+    def setup_patronictl_config(self):
+        """Write a patronictl.yaml so patronictl can discover etcd3_grpc."""
+        import click
+        config_dir = click.get_app_dir('patroni')
+        os.makedirs(config_dir, exist_ok=True)
+        config_path = os.path.join(config_dir, 'patronictl.yaml')
+        config = {'etcd3_grpc': self.get_dcs_config()}
+        with open(config_path, 'w') as f:
+            yaml.safe_dump(config, f, default_flow_style=False)
+
+    def query(self, key, scope='batman', group=None):
+        nodes = self._client.get_cluster(self.path(scope=scope) + '/')
+        path = self.path(key, scope, group)
+        for node in nodes:
+            if node['key'] == path:
+                return node['value']
+        return None
+
+    def cleanup_service_tree(self):
+        try:
+            self._client.delete_prefix(self.path(scope=''))
         except Exception as e:
             assert False, "exception when cleaning up etcd contents: {0}".format(e)
 
@@ -1127,6 +1247,8 @@ def before_all(context):
     context.request_executor = PatroniRequest({'ctl': ctl}, True)
     context.dcs_ctl = context.pctl.known_dcs[context.pctl.dcs](context)
     context.dcs_ctl.start()
+    if hasattr(context.dcs_ctl, 'setup_patronictl_config'):
+        context.dcs_ctl.setup_patronictl_config()
     try:
         context.dcs_ctl.cleanup_service_tree()
     except AssertionError:  # after_all handlers won't be executed in before_all
