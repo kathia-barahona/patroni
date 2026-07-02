@@ -198,6 +198,10 @@ class TestEtcd3GrpcClient:
 class TestCatchGrpcErrors:
     def test_catches_etcd3_grpc_error(self) -> None:
         class FakeDCS:
+            _has_failed = False
+            _handle_exception = Etcd3_grpc._handle_exception
+            handle_etcd_exceptions = Etcd3_grpc.handle_etcd_exceptions
+
             @catch_grpc_errors
             def do_something(self) -> None:
                 raise Etcd3GrpcError("test error")
@@ -206,6 +210,10 @@ class TestCatchGrpcErrors:
 
     def test_catches_retry_failed_error(self) -> None:
         class FakeDCS:
+            _has_failed = False
+            _handle_exception = Etcd3_grpc._handle_exception
+            handle_etcd_exceptions = Etcd3_grpc.handle_etcd_exceptions
+
             @catch_grpc_errors
             def do_something(self) -> None:
                 raise RetryFailedError("")
@@ -214,11 +222,28 @@ class TestCatchGrpcErrors:
 
     def test_passes_through_on_success(self) -> None:
         class FakeDCS:
+            _has_failed = False
+            _handle_exception = Etcd3_grpc._handle_exception
+            handle_etcd_exceptions = Etcd3_grpc.handle_etcd_exceptions
+
             @catch_grpc_errors
             def do_something(self) -> bool:
                 return True
 
         assert FakeDCS().do_something() is True
+
+    def test_raises_on_unexpected_exception(self) -> None:
+        class FakeDCS:
+            _has_failed = False
+            _handle_exception = Etcd3_grpc._handle_exception
+            handle_etcd_exceptions = Etcd3_grpc.handle_etcd_exceptions
+
+            @catch_grpc_errors
+            def do_something(self) -> None:
+                raise RuntimeError("unexpected")
+
+        with pytest.raises(Etcd3GrpcError):
+            FakeDCS().do_something()
 
 
 @patch("grpc.insecure_channel", return_value=mock_grpc_channel())

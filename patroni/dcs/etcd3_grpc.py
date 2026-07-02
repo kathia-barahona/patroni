@@ -368,11 +368,7 @@ def _prefix_range_end(prefix: str) -> bytes:
 
 def catch_grpc_errors(func: Callable[..., Any]) -> Any:
     def wrapper(self: "Etcd3_grpc", *args: Any, **kwargs: Any) -> Any:
-        try:
-            return func(self, *args, **kwargs)
-        except (Etcd3GrpcError, RetryFailedError) as e:
-            logger.error("%s failed: %r", func.__name__, e)
-            return False
+        return self.handle_etcd_exceptions(func, *args, **kwargs)
 
     return wrapper
 
@@ -392,6 +388,11 @@ class GrpcKVCache(StaleEtcdNodeGuard, Thread):
         self._dcs = dcs
         self._client = client
         self.condition = Condition()
+        self._leader_key = dcs.leader_path
+        self._optime_key = dcs.leader_optime_path
+        self._status_key = dcs.status_path
+        self._config_key = dcs.config_path
+        self._name = dcs._name
         self._is_ready = False
         self._object_cache: Dict[str, Dict[str, Any]] = {}
         self._object_cache_lock = Lock()
@@ -423,12 +424,17 @@ class GrpcKVCache(StaleEtcdNodeGuard, Thread):
     def _process_event(self, event: "_WatchEvent") -> None:
         kv = event.kv
         key = kv.key.decode("utf-8")
+        new_value = kv.value.decode("utf-8")
         node = {
             "key": key,
-            "value": kv.value.decode("utf-8"),
+            "value": new_value,
             "mod_revision": str(kv.mod_revision),
             "lease": str(kv.lease) if kv.lease else None,
         }
+
+        with self._object_cache_lock:
+            old_node = self._object_cache.get(key)
+            old_value = old_node["value"] if old_node else None
 
         if event.type == 1:  # DELETE
             success = self.delete(key, str(kv.mod_revision))
@@ -436,7 +442,23 @@ class GrpcKVCache(StaleEtcdNodeGuard, Thread):
             success = self.set(node, True)
 
         if success:
-            self._event.set()
+            value_changed = old_value != new_value and (
+                key == self._leader_key
+                or key in (self._optime_key, self._status_key) and new_value is not None
+                or key == self._config_key and old_value is not None and new_value is not None
+            )
+            if value_changed:
+                logger.debug('%s changed from %s to %s', key, old_value, new_value)
+
+            # We also want to wake up HA loop on replicas if leader optime (or status key) was updated
+            if value_changed and (key not in (self._optime_key, self._status_key)
+                                  or self._get_leader_value() != self._name):
+                self._dcs.event.set()
+
+    def _get_leader_value(self) -> Optional[str]:
+        with self._object_cache_lock:
+            node = self._object_cache.get(self._leader_key)
+            return node["value"] if node else None
 
     def _build_cache(self) -> None:
         prefix = self.__cluster_prefix()
@@ -550,6 +572,7 @@ class Etcd3_grpc(AbstractDCS):
         self._retry = Retry(
             deadline=config["retry_timeout"], max_delay=1, max_tries=-1, retry_exceptions=Etcd3GrpcError
         )
+        self._has_failed = False
         self._lease: Optional[int] = None
         self._last_lease_refresh: float = 0
 
@@ -570,14 +593,28 @@ class Etcd3_grpc(AbstractDCS):
         retry = self._retry.copy()
         return retry(method, *args, **kwargs)
 
+    def _handle_exception(self, e: Exception, raise_ex: Optional[Exception] = None) -> None:
+        if not self._has_failed:
+            logger.exception('')
+        else:
+            logger.error(e)
+        self._has_failed = True
+        if isinstance(raise_ex, Exception):
+            raise raise_ex
+
+    def handle_etcd_exceptions(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        try:
+            retval = func(self, *args, **kwargs)
+            self._has_failed = False
+            return retval
+        except (RetryFailedError, Etcd3GrpcError) as e:
+            self._handle_exception(e)
+            return False
+        except Exception as e:
+            self._handle_exception(e, raise_ex=Etcd3GrpcError('unexpected error'))
+
     def _connect_with_retry(self) -> None:
-        while True:
-            try:
-                self._client.connect()
-                return
-            except Exception:
-                logger.info("waiting on etcd (gRPC)")
-                time.sleep(5)
+        self.retry(self._client.connect)
 
     def _create_lease(self) -> None:
         while not self._lease:
@@ -819,11 +856,32 @@ class Etcd3_grpc(AbstractDCS):
 
     @catch_grpc_errors
     def set_failover_value(self, value: str, version: Optional[str] = None) -> bool:
-        return bool(self._client.put(self.failover_path, value))
+        return self._put_with_revision(self.failover_path, value, version)
 
     @catch_grpc_errors
     def set_config_value(self, value: str, version: Optional[str] = None) -> bool:
-        return bool(self._client.put(self.config_path, value))
+        return self._put_with_revision(self.config_path, value, version)
+
+    def _put_with_revision(self, key: str, value: str, mod_revision: Optional[str] = None) -> bool:
+        if mod_revision is None:
+            return bool(self._client.put(key, value))
+        compare = [
+            rpc_pb2.Compare(
+                result=rpc_pb2.Compare.EQUAL,
+                target=rpc_pb2.Compare.MOD,
+                key=key.encode(),
+                mod_revision=int(mod_revision),
+            )
+        ]
+        success = [
+            rpc_pb2.RequestOp(
+                request_put=rpc_pb2.PutRequest(
+                    key=key.encode(),
+                    value=value.encode(),
+                )
+            )
+        ]
+        return bool(self.retry(self._client.txn, compare, success).succeeded)
 
     @catch_grpc_errors
     def _write_leader_optime(self, last_lsn: str) -> bool:
@@ -874,11 +932,47 @@ class Etcd3_grpc(AbstractDCS):
 
     @catch_grpc_errors
     def set_sync_state_value(self, value: str, version: Optional[str] = None) -> Union[bool, str]:
+        if version is not None:
+            compare = [
+                rpc_pb2.Compare(
+                    result=rpc_pb2.Compare.EQUAL,
+                    target=rpc_pb2.Compare.MOD,
+                    key=self.sync_path.encode(),
+                    mod_revision=int(version),
+                )
+            ]
+            success = [
+                rpc_pb2.RequestOp(
+                    request_put=rpc_pb2.PutRequest(
+                        key=self.sync_path.encode(),
+                        value=value.encode(),
+                    )
+                )
+            ]
+            resp = self.retry(self._client.txn, compare, success)
+            return str(resp.header.revision) if resp.succeeded else False
         resp = self.retry(self._client.put, self.sync_path, value)
         return str(resp.header.revision)
 
     @catch_grpc_errors
     def delete_sync_state(self, version: Optional[str] = None) -> bool:
+        if version is not None:
+            compare = [
+                rpc_pb2.Compare(
+                    result=rpc_pb2.Compare.EQUAL,
+                    target=rpc_pb2.Compare.MOD,
+                    key=self.sync_path.encode(),
+                    mod_revision=int(version),
+                )
+            ]
+            success = [
+                rpc_pb2.RequestOp(
+                    request_delete_range=rpc_pb2.DeleteRangeRequest(
+                        key=self.sync_path.encode(),
+                    )
+                )
+            ]
+            return bool(self.retry(self._client.txn, compare, success).succeeded)
         return bool(self.retry(self._client.delete, self.sync_path))
 
     def _stop_watcher(self) -> None:
